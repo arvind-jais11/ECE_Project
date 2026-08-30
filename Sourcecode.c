@@ -1,0 +1,283 @@
+#define BLYNK_TEMPLATE_ID   "TMPL3Gg37-yaX"
+#define BLYNK_TEMPLATE_NAME "Water Monitoring"
+#define BLYNK_AUTH_TOKEN    "cHSds6EJnm2WNW1b0dayLXKrYVgXbQbK"
+#define BLYNK_PRINT         Serial
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <RTClib.h>
+#include <DHT.h>
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+
+const char* ssid     = "Smart Clock";
+const char* password = "Smart Clock";
+
+#define DHT_PIN         4
+#define DHT_TYPE        DHT11
+#define TRIG_PIN        5
+#define ECHO_PIN        18
+#define TDS_PIN         32
+#define TURB_PIN        35
+#define TANK_HEIGHT_CM  18
+
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+RTC_DS3231 rtc;
+DHT dht(DHT_PIN, DHT_TYPE);
+
+float   temperature = 0.0;
+float   humidity    = 0.0;
+int     waterLevel  = 0;
+int     tdsValue    = 0;
+int     turbidity   = 0;
+String  timeStr     = "";
+String  dateStr     = "";
+
+unsigned long lastSensorRead    = 0;
+unsigned long lastDisplayChange = 0;
+unsigned long lastBlynkSend     = 0;
+int           displayPage       = 0;
+
+String getTimeString(DateTime now) {
+  int h = now.hour();
+  int m = now.minute();
+  String ampm = "AM";
+  if (h >= 12) {
+    ampm = "PM";
+    if (h > 12) h -= 12;
+  }
+  if (h == 0) h = 12;
+  char buf[12];
+  sprintf(buf, "%02d:%02d %s", h, m, ampm.c_str());
+  return String(buf);
+}
+
+String getDateString(DateTime now) {
+  char buf[12];
+  sprintf(buf, "%02d/%02d/%04d", now.day(), now.month(), now.year());
+  return String(buf);
+}
+
+String centre(String s) {
+  int len = s.length();
+  if (len >= 20) return s.substring(0, 20);
+  int leftPad  = (20 - len) / 2;
+  int rightPad = 20 - len - leftPad;
+  String out = "";
+  for (int i = 0; i < leftPad;  i++) out += " ";
+  out += s;
+  for (int i = 0; i < rightPad; i++) out += " ";
+  return out;
+}
+
+float readUltrasonicCM() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long dur = pulseIn(ECHO_PIN, HIGH, 30000);
+  if (dur == 0) return TANK_HEIGHT_CM;
+  return (dur * 0.034 / 2.0);
+}
+
+int calcWaterLevel(float distCM) {
+  float depth = TANK_HEIGHT_CM - distCM;
+  if (depth < 0)               depth = 0;
+  if (depth > TANK_HEIGHT_CM)  depth = TANK_HEIGHT_CM;
+  float pct     = (depth / (float)TANK_HEIGHT_CM) * 100.0;
+  int   rounded = (int)((pct + 12.5) / 25.0) * 25;
+  if (rounded > 100) rounded = 100;
+  if (rounded < 0)   rounded = 0;
+  return rounded;
+}
+
+int readTDS() {
+  long sum = 0;
+  for (int i = 0; i < 10; i++) {
+    sum += analogRead(TDS_PIN);
+    delay(5);
+  }
+  float raw     = sum / 10.0;
+  float voltage = raw * (3.3 / 4095.0);
+  float tds     = (133.42 * pow(voltage, 3)
+                 - 255.86 * pow(voltage, 2)
+                 + 857.39 * voltage) * 0.5;
+  if (tds < 0) tds = 0;
+  return (int)tds;
+}
+
+int readTurbidityRaw() {
+  long sum = 0;
+  for (int i = 0; i < 10; i++) {
+    sum += analogRead(TURB_PIN);
+    delay(5);
+  }
+  int raw    = (int)(sum / 10);
+  int mapped = map(raw, 0, 4095, 0, 3000);
+  return constrain(mapped, 0, 3000);
+}
+
+void readAllSensors() {
+  DateTime now = rtc.now();
+  timeStr  = getTimeString(now);
+  dateStr  = getDateString(now);
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+  if (!isnan(h) && !isnan(t)) {
+    humidity    = h;
+    temperature = t;
+  }
+  float dist = readUltrasonicCM();
+  waterLevel  = calcWaterLevel(dist);
+  tdsValue    = readTDS();
+  turbidity   = readTurbidityRaw();
+}
+
+void lcdShowTimeDate() {
+  lcd.setCursor(0, 0);
+  lcd.print(centre("Time: " + timeStr));
+  lcd.setCursor(0, 1);
+  lcd.print(centre("Date: " + dateStr));
+}
+
+void clearRows23() {
+  lcd.setCursor(0, 2);
+  lcd.print("                    ");
+  lcd.setCursor(0, 3);
+  lcd.print("                    ");
+}
+
+void lcdShowTemperature() {
+  clearRows23();
+  lcd.setCursor(0, 2);
+  lcd.print(centre("- TEMPERATURE -"));
+  lcd.setCursor(0, 3);
+  lcd.print(centre(String(temperature, 1) + " \xDF" "C"));
+}
+
+void lcdShowHumidity() {
+  clearRows23();
+  lcd.setCursor(0, 2);
+  lcd.print(centre("- HUMIDITY -"));
+  lcd.setCursor(0, 3);
+  lcd.print(centre(String((int)humidity) + " %"));
+}
+
+void lcdShowWaterLevel() {
+  clearRows23();
+  lcd.setCursor(0, 2);
+  lcd.print(centre("- WATER LEVEL -"));
+  lcd.setCursor(0, 3);
+  lcd.print(centre(String(waterLevel) + " %"));
+}
+
+void lcdShowTDS() {
+  clearRows23();
+  lcd.setCursor(0, 2);
+  lcd.print(centre("- WATER PURITY -"));
+  lcd.setCursor(0, 3);
+  lcd.print(centre(String(tdsValue) + " ppm"));
+}
+
+void lcdShowTurbidity() {
+  clearRows23();
+  lcd.setCursor(0, 2);
+  lcd.print(centre("- TURBIDITY -"));
+  lcd.setCursor(0, 3);
+  lcd.print(centre(String(turbidity) + " NTU"));
+}
+
+void sendToBlynk() {
+  Blynk.virtualWrite(V0, temperature);
+  Blynk.virtualWrite(V1, (int)humidity);
+  Blynk.virtualWrite(V2, waterLevel);
+  Blynk.virtualWrite(V3, tdsValue);
+  Blynk.virtualWrite(V4, turbidity);
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22);
+
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(centre("Smart Clock"));
+  lcd.setCursor(0, 1);
+  lcd.print(centre("Water Monitor v1.0"));
+  lcd.setCursor(0, 2);
+  lcd.print(centre("Initializing..."));
+
+  if (!rtc.begin()) {
+    lcd.setCursor(0, 3);
+    lcd.print(centre("RTC ERROR!"));
+    while (1) delay(1000);
+  }
+
+  rtc.adjust(DateTime(2026, 5, 21, 11, 5, 0));
+
+  dht.begin();
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  lcd.setCursor(0, 3);
+  lcd.print(centre("Connecting WiFi..."));
+
+  WiFi.begin(ssid, password);
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(500);
+    attempts++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    lcd.setCursor(0, 3);
+    lcd.print(centre("WiFi Connected!"));
+    Blynk.config(BLYNK_AUTH_TOKEN);
+    Blynk.connect(3000);
+  } else {
+    lcd.setCursor(0, 3);
+    lcd.print(centre("WiFi Failed-Offline"));
+  }
+
+  delay(1500);
+  lcd.clear();
+  readAllSensors();
+}
+
+void loop() {
+  if (WiFi.status() == WL_CONNECTED) {
+    Blynk.run();
+  }
+
+  unsigned long now = millis();
+
+  if (now - lastSensorRead >= 2000) {
+    lastSensorRead = now;
+    readAllSensors();
+  }
+
+  if (now - lastDisplayChange >= 3000) {
+    lastDisplayChange = now;
+    displayPage = (displayPage + 1) % 5;
+  }
+
+  lcdShowTimeDate();
+
+  switch (displayPage) {
+    case 0: lcdShowTemperature(); break;
+    case 1: lcdShowHumidity();    break;
+    case 2: lcdShowWaterLevel();  break;
+    case 3: lcdShowTDS();         break;
+    case 4: lcdShowTurbidity();   break;
+  }
+
+  if (WiFi.status() == WL_CONNECTED && (now - lastBlynkSend >= 5000)) {
+    lastBlynkSend = now;
+    sendToBlynk();
+  }
+
+  delay(400);
+}
